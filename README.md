@@ -23,8 +23,6 @@ EPUB reader for the **Nintendo Switch**.
 
 ## Controls (Handheld Portrait)
 
-Since the console is held vertically, the controls are mapped for maximum ergonomic comfort:
-
 | Button | Action |
 | :--- | :--- |
 | **A** | Toggle Page Number / Next Page |
