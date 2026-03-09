@@ -8,7 +8,7 @@ EPUB reader for the **Nintendo Switch**.
 
 ![](assets/home.jpg)
 
-![](assets/readt.jpg)
+![](assets/read.jpg)
 
 ---
 
