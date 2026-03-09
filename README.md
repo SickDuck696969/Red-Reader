@@ -1,7 +1,10 @@
 # Description
 
 EPUB reader for the **Nintendo Switch**.
-
+<p align="center">
+  <img src="assets/home.jpg" width="300">
+  <img src="assets/read.jpg" width="300">
+</p>
 ---
 
 ## Screenshots
