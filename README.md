@@ -1,4 +1,3 @@
-#Red Reader
 ## Description
 
 EPUB reader for the **Nintendo Switch**.
