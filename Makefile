@@ -45,7 +45,7 @@ BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
 INCLUDES	:=	include
-#ROMFS	:=	romfs
+ROMFS	:=	romfs
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -61,7 +61,7 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions
 ASFLAGS	:=	$(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) -flto -Wl,--gc-sections -Wl,-s -Wl,-Map,$(notdir $*.map)                                                                                                                
 
-LIBS	:= -lmupdf -lmupdf-third -lSDL2_image -lwebp -ljpeg -lpng -lfreetype -lharfbuzz -lbz2 -lz -lSDL2 -lEGL -lglapi -ldrm_nouveau -lnx
+LIBS := -lmupdf -lmupdf-third -lSDL2_image -lwebp -ljpeg -lpng -lfreetype -lharfbuzz -lbz2 -lz -lSDL2 -lEGL -lglapi -ldrm_nouveau -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

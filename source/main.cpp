@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <vector>
 #include <string>
+#include <algorithm> 
+#include <cmath>
 
 enum AppState { STATE_LIBRARY, STATE_READING };
 
@@ -13,137 +15,247 @@ struct Book {
     std::string filepath;
     SDL_Texture* cover_tex;
     SDL_Rect rect; 
-    SDL_Rect src_rect; // Khung dùng để lưu tọa độ phần ảnh đã bị cắt viền trắng
+    SDL_Rect src_rect;
 };
 
-// --- HÀM LƯU VÀ ĐỌC TIẾN ĐỘ ---
+// --- HÀM KIỂM TRA ĐỊNH DẠNG FILE ---
+bool is_supported_file(const std::string& fname) {
+    size_t pos = fname.find_last_of('.');
+    if (pos == std::string::npos) return false;
+    std::string ext = fname.substr(pos);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext == ".epub" || ext == ".pdf" || ext == ".cbr" || ext == ".cbz";
+}
+
+// --- HÀM LƯU/ĐỌC TIẾN ĐỘ TỪNG SÁCH ---
 int load_progress(const std::string& filepath) {
-    int page = 0;
-    float dummy; 
+    int page = 0; float dummy; 
     std::string save_path = filepath + ".save";
     FILE* f = fopen(save_path.c_str(), "r");
-    if (f) {
-        if (fscanf(f, "%d %f", &page, &dummy) < 1) page = 0;
-        fclose(f);
-    }
+    if (f) { if (fscanf(f, "%d %f", &page, &dummy) < 1) page = 0; fclose(f); }
     return page;
 }
 
 void save_progress(const std::string& filepath, int page) {
     std::string save_path = filepath + ".save";
     FILE* f = fopen(save_path.c_str(), "w");
-    if (f) {
-        fprintf(f, "%d", page);
-        fclose(f);
-    }
+    if (f) { fprintf(f, "%d", page); fclose(f); }
 }
 
-// --- HÀM LƯU VÀ ĐỌC CỠ CHỮ TOÀN CỤC ---
-float load_global_font_size() {
-    float size = 18.0f; 
+// --- HÀM LƯU/ĐỌC CÀI ĐẶT GLOBAL ---
+void load_global_settings(float& size, int& is_portrait, int& is_dark_mode, int& bg_index, std::string& last_read) {
+    size = 18.0f; is_portrait = 0; is_dark_mode = 0; bg_index = 0; last_read = "";
     FILE* f = fopen("sdmc:/lib/global_setting.dat", "r");
     if (f) {
-        fscanf(f, "%f", &size);
+        char path_buf[512] = {0};
+        if (fscanf(f, "%f %d %d %d\n", &size, &is_portrait, &is_dark_mode, &bg_index) >= 1) {
+            if (fgets(path_buf, sizeof(path_buf), f)) {
+                last_read = path_buf;
+                while (!last_read.empty() && (last_read.back() == '\n' || last_read.back() == '\r')) {
+                    last_read.pop_back();
+                }
+            }
+        }
         fclose(f);
     }
     if (size < 10.0f || size > 60.0f) size = 18.0f;
-    return size;
+    if (bg_index < 0 || bg_index > 2) bg_index = 0; 
 }
 
-void save_global_font_size(float size) {
+void save_global_settings(float size, int is_portrait, int is_dark_mode, int bg_index, const std::string& last_read) {
     FILE* f = fopen("sdmc:/lib/global_setting.dat", "w");
     if (f) {
-        fprintf(f, "%f", size);
+        fprintf(f, "%f %d %d %d\n%s", size, is_portrait, is_dark_mode, bg_index, last_read.c_str());
         fclose(f);
     }
 }
 
-// --- HÀM RENDER TRANG SÁCH ---
-void load_page(fz_context *ctx, fz_document *doc, int page_num, SDL_Renderer *renderer, SDL_Texture **page_texture) {
-    if (*page_texture) {
-        SDL_DestroyTexture(*page_texture);
-        *page_texture = NULL;
-    }
+// --- HÀM RENDER TRANG SÁCH & DARK MODE ---
+void load_page(fz_context *ctx, fz_document *doc, int page_num, SDL_Renderer *renderer, SDL_Texture **page_texture, bool dark_mode, float target_w, float target_h) {
+    if (*page_texture) { SDL_DestroyTexture(*page_texture); *page_texture = NULL; }
     fz_try(ctx) {
-        fz_matrix transform = fz_scale(1.0f, 1.0f);
+        fz_page *page = fz_load_page(ctx, doc, page_num);
+        fz_rect bounds = fz_bound_page(ctx, page);
+        fz_drop_page(ctx, page);
+
+        float bw = bounds.x1 - bounds.x0;
+        float bh = bounds.y1 - bounds.y0;
+        if (bw <= 0) bw = 100.0f; 
+        if (bh <= 0) bh = 100.0f;
+
+        float scale_x = target_w / bw;
+        float scale_y = target_h / bh;
+        float scale = std::min(scale_x, scale_y);
+
+        fz_matrix transform = fz_scale(scale, scale);
         fz_pixmap *pix = fz_new_pixmap_from_page_number(ctx, doc, page_num, transform, fz_device_rgb(ctx), 0);
+        
         int w = fz_pixmap_width(ctx, pix);
         int h = fz_pixmap_height(ctx, pix);
         unsigned char* samples = fz_pixmap_samples(ctx, pix);
+        
         SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(samples, w, h, 24, w * 3, 0x0000FF, 0x00FF00, 0xFF0000, 0);
         if (surface) {
+            if (dark_mode) {
+                Uint8* p = (Uint8*)surface->pixels;
+                int total_bytes = w * h * 3;
+                for (int i = 0; i < total_bytes; i++) p[i] = 255 - p[i];
+            }
+            SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
             *page_texture = SDL_CreateTextureFromSurface(renderer, surface);
             SDL_FreeSurface(surface);
         }
         fz_drop_pixmap(ctx, pix);
     } fz_catch(ctx) {}
+    
+    fz_empty_store(ctx); 
+}
+
+void update_layout(fz_context* ctx, fz_document* doc, bool is_portrait, float font_size, int& current_page, int& total_pages, float exact_progress, SDL_Renderer* renderer, SDL_Texture** page_texture, bool dark_mode) {
+    float layout_w = is_portrait ? 720.0f : 800.0f;
+    float layout_h = is_portrait ? 1270.0f : 670.0f; 
+    
+    fz_layout_document(ctx, doc, layout_w, layout_h, font_size);
+    total_pages = fz_count_pages(ctx, doc);
+    
+    current_page = (int)(exact_progress * (total_pages > 1 ? total_pages - 1 : 0) + 0.5f);
+    if (current_page >= total_pages) current_page = total_pages - 1;
+    if (current_page < 0) current_page = 0;
+    
+    load_page(ctx, doc, current_page, renderer, page_texture, dark_mode, layout_w, layout_h);
 }
 
 int main(int argc, char* argv[]) {
     romfsInit();
-    
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
 
     SDL_Init(SDL_INIT_VIDEO);
-    IMG_Init(IMG_INIT_JPG | IMG_INIT_PNG);
+    IMG_Init(IMG_INIT_JPG | IMG_INIT_PNG); 
     
-    SDL_Window* window = SDL_CreateWindow("Switch E-Reader", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, 0);
+    SDL_Window* window = SDL_CreateWindow("Red Reader", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, 0);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
     SDL_Texture* render_target_vert = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, 720, 1280);
-    SDL_Texture* bg_texture = IMG_LoadTexture(renderer, "sdmc:/lib/bg.jpg");
+    
+    SDL_Texture* bg_textures[3] = {NULL, NULL, NULL};
+    bg_textures[0] = IMG_LoadTexture(renderer, "romfs:/bg1.jpg");
+    bg_textures[1] = IMG_LoadTexture(renderer, "romfs:/bg2.jpg");
+    bg_textures[2] = IMG_LoadTexture(renderer, "romfs:/bg3.jpg");
+    if (!bg_textures[0]) bg_textures[0] = IMG_LoadTexture(renderer, "romfs:/bg.jpg");
 
-    fz_context *ctx = fz_new_context(NULL, NULL, 64 * 1024 * 1024);
+    // NẠP ICON TỪ ROMFS ĐỂ DÙNG Ở MÀN HÌNH LOADING
+    SDL_Texture* app_icon_tex = IMG_LoadTexture(renderer, "romfs:/icon.png");
+    if (!app_icon_tex) app_icon_tex = IMG_LoadTexture(renderer, "romfs:/icon.jpg");
+
+    float global_font_size;
+    int is_port_int, is_dark_int, current_bg_index;
+    std::string last_read_filepath;
+    load_global_settings(global_font_size, is_port_int, is_dark_int, current_bg_index, last_read_filepath);
+    bool is_portrait = (is_port_int != 0);
+    bool is_dark_mode = (is_dark_int != 0);
+
+    fz_context *ctx = fz_new_context(NULL, NULL, 16 * 1024 * 1024);
     fz_register_document_handlers(ctx);
+    fz_disable_icc(ctx); 
 
     std::vector<Book> library;
 
-    // --- QUÉT THƯ MỤC LIB VÀ TỰ ĐỘNG CẮT VIỀN TRẮNG ---
-    DIR *dir;
-    struct dirent *ent;
-    if ((dir = opendir("sdmc:/lib")) != NULL) {
+    // QUÉT LẦN 1: ĐẾM TỔNG SỐ FILE 
+    int total_files = 0;
+    DIR *dir = opendir("sdmc:/lib");
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (is_supported_file(ent->d_name)) total_files++;
+        }
+        closedir(dir);
+    }
+
+    // QUÉT LẦN 2: NẠP SÁCH & RENDER LOADING SCREEN MƯỢT MÀ
+    if (total_files > 0 && (dir = opendir("sdmc:/lib")) != NULL) {
         int index = 0;
+        struct dirent *ent;
         while ((ent = readdir(dir)) != NULL) {
             std::string fname = ent->d_name;
-            if (fname.length() > 5 && fname.substr(fname.length() - 5) == ".epub") {
-                Book b;
+            if (is_supported_file(fname)) {
+                
+                // === VẼ MÀN HÌNH LOADING *TRƯỚC* KHI NẠP SÁCH ===
+                SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
+                SDL_RenderClear(renderer);
+                if (bg_textures[current_bg_index]) {
+                    SDL_Rect bg_rect = {0, 0, 1280, 720};
+                    SDL_RenderCopy(renderer, bg_textures[current_bg_index], NULL, &bg_rect);
+                }
+                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200); // Lớp mờ đen
+                SDL_Rect overlay = {0, 0, 1280, 720};
+                SDL_RenderFillRect(renderer, &overlay);
+                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+
+                // Hiển thị Icon App
+                if (app_icon_tex) {
+                    SDL_Rect icon_dest = { 1280/2 - 60, 720/2 - 100, 150, 150 };
+                    SDL_RenderCopy(renderer, app_icon_tex, NULL, &icon_dest);
+                }
+
+                // Vẽ thanh Progress (Tính phần trăm chính xác)
+                float progress = (float)index / total_files;
+                SDL_Rect bg_bar = { 1280/2 - 200, 720/2 + 60, 400, 8 };
+                SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
+                SDL_RenderFillRect(renderer, &bg_bar);
+                
+                SDL_Rect fg_bar = { 1280/2 - 200, 720/2 + 60, (int)(400 * progress), 8 };
+                SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
+                SDL_RenderFillRect(renderer, &fg_bar);
+                
+                SDL_RenderPresent(renderer); // XUẤT HÌNH NGAY LẬP TỨC
+                // =================================================
+
+                // === BẮT ĐẦU XỬ LÝ NẶNG BÊN DƯỚI NỀN ===
+                Book b; 
                 b.filepath = "sdmc:/lib/" + fname;
+                b.cover_tex = NULL;
+                b.rect = {0, 0, 0, 0};
+                b.src_rect = {0, 0, 0, 0};
                 
                 fz_document *temp_doc = NULL;
                 fz_try(ctx) {
                     temp_doc = fz_open_document(ctx, b.filepath.c_str());
-                    
                     fz_layout_document(ctx, temp_doc, 400.0f, 600.0f, 18.0f);
-                    fz_matrix transform = fz_scale(0.4f, 0.4f);
-                    fz_pixmap *pix = fz_new_pixmap_from_page_number(ctx, temp_doc, 0, transform, fz_device_rgb(ctx), 0);
+                    
+                    fz_page *page = fz_load_page(ctx, temp_doc, 0);
+                    fz_rect bounds = fz_bound_page(ctx, page);
+                    fz_drop_page(ctx, page);
+                    
+                    float bw = bounds.x1 - bounds.x0;
+                    float bh = bounds.y1 - bounds.y0;
+                    if (bw <= 0) bw = 100.0f;
+                    if (bh <= 0) bh = 100.0f;
+                    float scale_x = 180.0f / bw;
+                    float scale_y = 260.0f / bh;
+                    float scale = std::min(scale_x, scale_y);
+
+                    fz_pixmap *pix = fz_new_pixmap_from_page_number(ctx, temp_doc, 0, fz_scale(scale, scale), fz_device_rgb(ctx), 0);
                     
                     int w = fz_pixmap_width(ctx, pix);
                     int h = fz_pixmap_height(ctx, pix);
                     unsigned char* samples = fz_pixmap_samples(ctx, pix);
 
-                    // THUẬT TOÁN AUTO-CROP: Quét để tìm tọa độ tấm ảnh lõi (bỏ qua viền trắng)
                     int min_x = w, min_y = h, max_x = 0, max_y = 0;
                     for (int y = 0; y < h; ++y) {
                         for (int x = 0; x < w; ++x) {
                             int idx = (y * w + x) * 3;
-                            // Ngưỡng < 240 để loại trừ các màu trắng bệch hoặc trắng hơi xám do đổ bóng
                             if (samples[idx] < 240 || samples[idx+1] < 240 || samples[idx+2] < 240) {
-                                if (x < min_x) min_x = x;
+                                if (x < min_x) min_x = x; 
                                 if (x > max_x) max_x = x;
-                                if (y < min_y) min_y = y;
+                                if (y < min_y) min_y = y; 
                                 if (y > max_y) max_y = y;
                             }
                         }
                     }
-
-                    // Nếu tìm thấy ảnh bên trong, lấy tọa độ mới. Nếu ảnh trắng bóc thì giữ nguyên.
-                    if (min_x <= max_x && min_y <= max_y) {
-                        b.src_rect = { min_x, min_y, max_x - min_x + 1, max_y - min_y + 1 };
-                    } else {
-                        b.src_rect = { 0, 0, w, h };
-                    }
+                    b.src_rect = (min_x <= max_x && min_y <= max_y) ? SDL_Rect{min_x, min_y, max_x - min_x + 1, max_y - min_y + 1} : SDL_Rect{0, 0, w, h};
 
                     SDL_Surface* surf = SDL_CreateRGBSurfaceFrom(samples, w, h, 24, w * 3, 0x0000FF, 0x00FF00, 0xFF0000, 0);
                     b.cover_tex = SDL_CreateTextureFromSurface(renderer, surf);
@@ -154,30 +266,110 @@ int main(int argc, char* argv[]) {
                 if (temp_doc) fz_drop_document(ctx, temp_doc);
                 fz_empty_store(ctx); 
                 
-                int col = index % 3;
-                int row = index / 3;
-                b.rect = { 50 + col * 215, 60 + row * 280, 160, 240 }; 
-                
+                int col = index % 5;
+                int row = index / 5;
+                b.rect = { 60 + col * 235, 60 + row * 310, 180, 260 }; 
                 library.push_back(b);
-                index++;
+                
+                index++; // Tăng biến index sau khi xử lý xong 1 sách
             }
         }
         closedir(dir);
+
+        // VẼ MÀN HÌNH 100% TRƯỚC KHI VÀO GIAO DIỆN CHÍNH
+        SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
+        SDL_RenderClear(renderer);
+        if (bg_textures[current_bg_index]) {
+            SDL_Rect bg_rect = {0, 0, 1280, 720};
+            SDL_RenderCopy(renderer, bg_textures[current_bg_index], NULL, &bg_rect);
+        }
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200);
+        SDL_Rect overlay = {0, 0, 1280, 720};
+        SDL_RenderFillRect(renderer, &overlay);
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+
+        if (app_icon_tex) {
+            SDL_Rect icon_dest = { 1280/2 - 60, 720/2 - 100, 120, 120 };
+            SDL_RenderCopy(renderer, app_icon_tex, NULL, &icon_dest);
+        }
+        SDL_Rect bg_bar = { 1280/2 - 200, 720/2 + 60, 400, 8 };
+        SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
+        SDL_RenderFillRect(renderer, &bg_bar);
+        SDL_Rect fg_bar = { 1280/2 - 200, 720/2 + 60, 400, 8 }; // Full 100%
+        SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
+        SDL_RenderFillRect(renderer, &fg_bar);
+        SDL_RenderPresent(renderer);
     }
 
     AppState state = STATE_LIBRARY;
     fz_document *active_doc = NULL;
     SDL_Texture* page_texture = NULL;
-    
     std::string active_filepath = "";
-    int total_pages = 0;
-    int current_page = 0;
-    
-    float global_font_size = load_global_font_size();
+    int total_pages = 0, current_page = 0;
+    float exact_progress = 0.0f;
 
-    bool running = true;
-    bool is_touching = false;
-    float start_touch_x = 0.0f;
+    float scroll_y = 0.0f;
+    float target_scroll_y = 0.0f;
+
+    int selected_book_index = 0; 
+    bool running = true, is_touching = false;
+    float start_touch_x = 0.0f, start_touch_y = 0.0f;
+    float start_scroll_y = 0.0f;
+    bool has_swiped = false;
+
+    auto open_book = [&](const Book& b) {
+        // HIỂN THỊ MÀN HÌNH LOADING KHI MỞ TỪNG QUYỂN SÁCH
+        SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
+        SDL_RenderClear(renderer);
+        if (bg_textures[current_bg_index]) {
+            SDL_Rect bg_rect = {0, 0, 1280, 720};
+            SDL_RenderCopy(renderer, bg_textures[current_bg_index], NULL, &bg_rect);
+        }
+        
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 210); 
+        SDL_Rect overlay = {0, 0, 1280, 720};
+        SDL_RenderFillRect(renderer, &overlay);
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+
+        if (b.cover_tex) {
+            SDL_Rect center_rect = { 1280/2 - 135, 720/2 - 195, 270, 390 };
+            for (int j = 0; j < 3; j++) {
+                SDL_Rect outline = { center_rect.x - j - 1, center_rect.y - j - 1, center_rect.w + (j * 2) + 2, center_rect.h + (j * 2) + 2 };
+                SDL_SetRenderDrawColor(renderer, 220, 220, 220, 255); 
+                SDL_RenderDrawRect(renderer, &outline);
+            }
+            SDL_RenderCopy(renderer, b.cover_tex, &b.src_rect, &center_rect);
+        }
+        
+        SDL_Rect load_line = { 1280/2 - 135, 720/2 + 215, 270, 4 };
+        SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255);
+        SDL_RenderFillRect(renderer, &load_line);
+        SDL_RenderPresent(renderer);
+
+        // XỬ LÝ SÁCH SAU KHI ĐÃ HIỂN THỊ UI
+        if (active_doc) fz_drop_document(ctx, active_doc);
+        active_filepath = b.filepath;
+        last_read_filepath = b.filepath; 
+        fz_try(ctx) {
+            active_doc = fz_open_document(ctx, b.filepath.c_str());
+            current_page = load_progress(active_filepath);
+            
+            float target_w = is_portrait ? 720.0f : 800.0f;
+            float target_h = is_portrait ? 1270.0f : 670.0f; 
+            fz_layout_document(ctx, active_doc, target_w, target_h, global_font_size);
+            total_pages = fz_count_pages(ctx, active_doc);
+            
+            if (current_page >= total_pages) current_page = total_pages - 1;
+            if (current_page < 0) current_page = 0;
+            
+            exact_progress = total_pages > 1 ? (float)current_page / (total_pages - 1) : 0.0f;
+            
+            load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
+            state = STATE_READING;
+        } fz_catch(ctx) {}
+    };
 
     while (appletMainLoop() && running) {
         padUpdate(&pad);
@@ -185,151 +377,277 @@ int main(int argc, char* argv[]) {
         
         if (kDown & HidNpadButton_Plus) running = false;
         
-        if (state == STATE_READING) {
+        if (state == STATE_LIBRARY) {
+            if (kDown & HidNpadButton_L) {
+                current_bg_index++;
+                if (current_bg_index > 2) current_bg_index = 0; 
+            }
+
+            if (!library.empty()) {
+                if (kDown & (HidNpadButton_Left | HidNpadButton_StickLLeft)) {
+                    if (selected_book_index > 0) selected_book_index--;
+                }
+                if (kDown & (HidNpadButton_Right | HidNpadButton_StickLRight)) {
+                    if (selected_book_index < (int)library.size() - 1) selected_book_index++;
+                }
+                if (kDown & (HidNpadButton_Up | HidNpadButton_StickLUp)) {
+                    if (selected_book_index >= 5) selected_book_index -= 5;
+                    else selected_book_index = 0; 
+                }
+                if (kDown & (HidNpadButton_Down | HidNpadButton_StickLDown)) {
+                    if (selected_book_index + 5 < (int)library.size()) selected_book_index += 5;
+                    else selected_book_index = (int)library.size() - 1; 
+                }
+
+                int selected_row = selected_book_index / 5;
+                int book_top = 60 + selected_row * 310;
+                int book_bottom = book_top + 260;
+
+                if (book_bottom > target_scroll_y + 720 - 60) {
+                    target_scroll_y = book_bottom - 720 + 60;
+                } 
+                else if (book_top < target_scroll_y + 60) {
+                    target_scroll_y = book_top - 60;
+                }
+
+                int max_row = (library.size() - 1) / 5;
+                int max_scroll = (60 + max_row * 310 + 260 + 60) - 720;
+                if (max_scroll < 0) max_scroll = 0;
+                if (target_scroll_y < 0) target_scroll_y = 0;
+                if (target_scroll_y > max_scroll) target_scroll_y = max_scroll;
+
+                if (kDown & HidNpadButton_A) open_book(library[selected_book_index]);
+                if (kDown & HidNpadButton_X) {
+                    if (!last_read_filepath.empty()) {
+                        for (const auto& book : library) {
+                            if (book.filepath == last_read_filepath) {
+                                open_book(book);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else if (state == STATE_READING) {
+            float target_w = is_portrait ? 720.0f : 800.0f;
+            float target_h = is_portrait ? 1270.0f : 670.0f;
+
             if (kDown & HidNpadButton_B) {
                 save_progress(active_filepath, current_page);
-                save_global_font_size(global_font_size); 
+                save_global_settings(global_font_size, is_portrait ? 1 : 0, is_dark_mode ? 1 : 0, current_bg_index, last_read_filepath);
                 
                 if (page_texture) { SDL_DestroyTexture(page_texture); page_texture = NULL; }
                 if (active_doc) { fz_drop_document(ctx, active_doc); active_doc = NULL; }
                 fz_empty_store(ctx); 
-                
                 state = STATE_LIBRARY;
             }
 
-            if ((kDown & HidNpadButton_A) || (kDown & HidNpadButton_Right)) {
-                if (current_page < total_pages - 1) {
-                    current_page++;
-                    load_page(ctx, active_doc, current_page, renderer, &page_texture);
-                }
+            if (kDown & HidNpadButton_Minus) {
+                is_dark_mode = !is_dark_mode;
+                load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
             }
 
+            if (kDown & HidNpadButton_R) {
+                is_portrait = !is_portrait;
+                update_layout(ctx, active_doc, is_portrait, global_font_size, current_page, total_pages, exact_progress, renderer, &page_texture, is_dark_mode);
+            }
+
+            if ((kDown & HidNpadButton_Right) || (kDown & HidNpadButton_A)) {
+                if (current_page < total_pages - 1) {
+                    current_page++;
+                    exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
+                    load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
+                }
+            }
             if (kDown & HidNpadButton_Left) {
                 if (current_page > 0) {
                     current_page--;
-                    load_page(ctx, active_doc, current_page, renderer, &page_texture);
+                    exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
+                    load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
                 }
             }
 
             if ((kDown & HidNpadButton_X) || (kDown & HidNpadButton_Y)) {
                 if (kDown & HidNpadButton_X) global_font_size += 2.0f; 
                 if (kDown & HidNpadButton_Y) global_font_size -= 2.0f; 
-                
                 if (global_font_size > 60.0f) global_font_size = 60.0f;
                 if (global_font_size < 10.0f) global_font_size = 10.0f;
-
-                float progress_ratio = total_pages > 0 ? (float)current_page / total_pages : 0.0f;
-                fz_layout_document(ctx, active_doc, 720.0f, 1280.0f, global_font_size);
-                
-                total_pages = fz_count_pages(ctx, active_doc);
-                current_page = (int)(progress_ratio * total_pages);
-                if (current_page >= total_pages) current_page = total_pages - 1;
-                
-                load_page(ctx, active_doc, current_page, renderer, &page_texture);
+                update_layout(ctx, active_doc, is_portrait, global_font_size, current_page, total_pages, exact_progress, renderer, &page_texture, is_dark_mode);
             }
+        }
+
+        if (state == STATE_LIBRARY) {
+            scroll_y += (target_scroll_y - scroll_y) * 0.15f; 
+            if (std::abs(target_scroll_y - scroll_y) < 0.5f) scroll_y = target_scroll_y;
         }
 
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            float logical_x = (1.0f - event.tfinger.y) * 720.0f;
-            float logical_y = event.tfinger.x * 1280.0f;
+            float logical_x = 0.0f, logical_y = 0.0f;
+            if (event.type == SDL_FINGERDOWN || event.type == SDL_FINGERUP || event.type == SDL_FINGERMOTION) {
+                logical_x = event.tfinger.x * 1280.0f;
+                logical_y = event.tfinger.y * 720.0f;
+                if (state == STATE_READING && is_portrait) {
+                    logical_x = (1.0f - event.tfinger.y) * 720.0f;
+                    logical_y = event.tfinger.x * 1280.0f;
+                }
+            }
 
             if (event.type == SDL_FINGERDOWN) {
                 is_touching = true;
                 start_touch_x = logical_x;
+                start_touch_y = logical_y;
+                start_scroll_y = target_scroll_y; 
+                has_swiped = false;
+            }
+            else if (event.type == SDL_FINGERMOTION && is_touching) {
+                float dx = logical_x - start_touch_x;
+                float dy = logical_y - start_touch_y;
+                if (std::abs(dx) > 15.0f || std::abs(dy) > 15.0f) has_swiped = true;
 
-                if (state == STATE_LIBRARY) {
-                    for (auto& b : library) {
-                        if (logical_x >= b.rect.x && logical_x <= b.rect.x + b.rect.w && logical_y >= b.rect.y && logical_y <= b.rect.y + b.rect.h) {
-                            if (active_doc) fz_drop_document(ctx, active_doc);
-                            active_filepath = b.filepath;
-                            
-                            fz_try(ctx) {
-                                active_doc = fz_open_document(ctx, b.filepath.c_str());
-                                current_page = load_progress(active_filepath);
-                                fz_layout_document(ctx, active_doc, 720.0f, 1280.0f, global_font_size);
-                                
-                                total_pages = fz_count_pages(ctx, active_doc);
-                                if (current_page >= total_pages) current_page = total_pages - 1;
-                                
-                                load_page(ctx, active_doc, current_page, renderer, &page_texture);
-                                state = STATE_READING;
-                            } fz_catch(ctx) {}
-                            break;
-                        }
-                    }
+                if (state == STATE_LIBRARY && has_swiped) {
+                    target_scroll_y = start_scroll_y - dy;
+                    
+                    int max_row = library.empty() ? 0 : (library.size() - 1) / 5;
+                    int max_scroll = (60 + max_row * 310 + 260 + 60) - 720;
+                    if (max_scroll < 0) max_scroll = 0;
+                    if (target_scroll_y < 0) target_scroll_y = 0;
+                    if (target_scroll_y > max_scroll) target_scroll_y = max_scroll;
+                    
+                    scroll_y = target_scroll_y; 
                 }
-            } 
+            }
             else if (event.type == SDL_FINGERUP && is_touching) {
                 is_touching = false;
                 
-                if (state == STATE_READING) {
+                if (!has_swiped && state == STATE_LIBRARY) {
+                    for (size_t i = 0; i < library.size(); i++) {
+                        auto& b = library[i];
+                        if (logical_x >= b.rect.x && logical_x <= b.rect.x + b.rect.w && 
+                            logical_y >= (b.rect.y - scroll_y) && logical_y <= (b.rect.y - scroll_y) + b.rect.h) {
+                            selected_book_index = i; 
+                            open_book(b);
+                            break;
+                        }
+                    }
+                } 
+                else if (state == STATE_READING && has_swiped) {
                     float dx = logical_x - start_touch_x;
-                    
+                    float target_w = is_portrait ? 720.0f : 800.0f;
+                    float target_h = is_portrait ? 1270.0f : 670.0f;
+
                     if (dx < -100.0f && current_page < total_pages - 1) { 
                         current_page++;
-                        load_page(ctx, active_doc, current_page, renderer, &page_texture);
+                        exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
+                        load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
                     } else if (dx > 100.0f && current_page > 0) { 
                         current_page--;
-                        load_page(ctx, active_doc, current_page, renderer, &page_texture);
+                        exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
+                        load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
                     }
                 }
             }
         }
 
-        SDL_SetRenderTarget(renderer, render_target_vert); 
+        SDL_SetRenderTarget(renderer, NULL); 
         
         if (state == STATE_LIBRARY) {
-            if (bg_texture) {
-                SDL_Rect bg_rect = {0, 0, 720, 1280};
-                SDL_RenderCopy(renderer, bg_texture, NULL, &bg_rect);
+            if (bg_textures[current_bg_index]) {
+                SDL_Rect bg_rect = {0, 0, 1280, 720};
+                SDL_RenderCopy(renderer, bg_textures[current_bg_index], NULL, &bg_rect);
             } else {
-                SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
+                SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
                 SDL_RenderClear(renderer);
             }
             
-            for (auto& b : library) {
-                // Vẽ Outline viền đen rỗng (Hollow rectangle)
-                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-                for (int i = 0; i < 3; i++) {
-                    SDL_Rect outline = { b.rect.x - i - 1, b.rect.y - i - 1, b.rect.w + (i * 2) + 2, b.rect.h + (i * 2) + 2 };
+            for (size_t i = 0; i < library.size(); i++) {
+                auto& b = library[i];
+
+                if (b.rect.y - scroll_y + b.rect.h < 0 || b.rect.y - scroll_y > 720) continue;
+
+                SDL_Rect draw_rect = { b.rect.x, b.rect.y - (int)scroll_y, b.rect.w, b.rect.h };
+
+                if ((int)i == selected_book_index) {
+                    SDL_SetRenderDrawColor(renderer, 255, 235, 50, 255); 
+                } 
+                else if (b.filepath == last_read_filepath) {
+                    SDL_SetRenderDrawColor(renderer, 50, 220, 50, 255); 
+                } 
+                else {
+                    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+                }
+                
+                for (int j = 0; j < 3; j++) {
+                    SDL_Rect outline = { draw_rect.x - j - 1, draw_rect.y - j - 1, draw_rect.w + (j * 2) + 2, draw_rect.h + (j * 2) + 2 };
                     SDL_RenderDrawRect(renderer, &outline);
                 }
-
-                // Vẽ ảnh bìa sách bằng b.src_rect (chỉ lấy phần lõi không có viền trắng) ép vừa khít vào b.rect
-                if (b.cover_tex) SDL_RenderCopy(renderer, b.cover_tex, &b.src_rect, &b.rect);
+                if (b.cover_tex) SDL_RenderCopy(renderer, b.cover_tex, &b.src_rect, &draw_rect);
             }
         } 
         else if (state == STATE_READING) {
-            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-            SDL_RenderClear(renderer);
+            int tex_w = 0, tex_h = 0;
             if (page_texture) {
-                SDL_Rect dest = {0, 0, 720, 1280};
-                SDL_RenderCopy(renderer, page_texture, NULL, &dest);
+                SDL_QueryTexture(page_texture, NULL, NULL, &tex_w, &tex_h);
+            }
+
+            if (is_portrait) {
+                SDL_SetRenderTarget(renderer, render_target_vert);
+                SDL_SetRenderDrawColor(renderer, is_dark_mode ? 20 : 255, is_dark_mode ? 20 : 255, is_dark_mode ? 20 : 255, 255);
+                SDL_RenderClear(renderer);
+                
+                if (page_texture) {
+                    SDL_Rect dest = { (720 - tex_w) / 2, (1270 - tex_h) / 2, tex_w, tex_h };
+                    SDL_RenderCopy(renderer, page_texture, NULL, &dest);
+                }
+
+                SDL_Rect bar_bg = {0, 1276, 720, 4}; 
+                SDL_SetRenderDrawColor(renderer, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, 255);
+                SDL_RenderFillRect(renderer, &bar_bg);
+                
+                SDL_Rect bar_fg = {0, 1276, (int)(720 * exact_progress), 4}; 
+                SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
+                SDL_RenderFillRect(renderer, &bar_fg);
+
+                SDL_SetRenderTarget(renderer, NULL);
+                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+                SDL_RenderClear(renderer);
+                SDL_Rect rot_dest = {280, -280, 720, 1280};
+                SDL_RenderCopyEx(renderer, render_target_vert, NULL, &rot_dest, 270.0, NULL, SDL_FLIP_NONE);
+            } 
+            else {
+                SDL_SetRenderDrawColor(renderer, is_dark_mode ? 20 : 255, is_dark_mode ? 20 : 255, is_dark_mode ? 20 : 255, 255);
+                SDL_RenderClear(renderer);
+                
+                if (page_texture) {
+                    SDL_Rect dest = { 240 + (800 - tex_w) / 2, 20 + (670 - tex_h) / 2, tex_w, tex_h };
+                    SDL_RenderCopy(renderer, page_texture, NULL, &dest);
+                }
+
+                SDL_Rect bar_bg = {240, 712, 800, 4}; 
+                SDL_SetRenderDrawColor(renderer, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, 255);
+                SDL_RenderFillRect(renderer, &bar_bg);
+                
+                SDL_Rect bar_fg = {240, 712, (int)(800 * exact_progress), 4}; 
+                SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
+                SDL_RenderFillRect(renderer, &bar_fg);
             }
         }
-
-        SDL_SetRenderTarget(renderer, NULL);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderClear(renderer);
-        
-        SDL_Rect rot_dest = {280, -280, 720, 1280};
-        SDL_RenderCopyEx(renderer, render_target_vert, NULL, &rot_dest, 270.0, NULL, SDL_FLIP_NONE);
 
         SDL_RenderPresent(renderer);
     }
 
-    if (state == STATE_READING) {
-        save_progress(active_filepath, current_page);
-        save_global_font_size(global_font_size);
-    }
+    if (state == STATE_READING) save_progress(active_filepath, current_page);
+    save_global_settings(global_font_size, is_portrait ? 1 : 0, is_dark_mode ? 1 : 0, current_bg_index, last_read_filepath);
 
-    for (auto& b : library) {
-        if (b.cover_tex) SDL_DestroyTexture(b.cover_tex);
-    }
+    for (auto& b : library) if (b.cover_tex) SDL_DestroyTexture(b.cover_tex);
     if (page_texture) SDL_DestroyTexture(page_texture);
     if (render_target_vert) SDL_DestroyTexture(render_target_vert);
-    if (bg_texture) SDL_DestroyTexture(bg_texture);
+    if (app_icon_tex) SDL_DestroyTexture(app_icon_tex);
+    
+    for (int i = 0; i < 3; i++) {
+        if (bg_textures[i]) SDL_DestroyTexture(bg_textures[i]);
+    }
     if (active_doc) fz_drop_document(ctx, active_doc);
     
     fz_drop_context(ctx);
