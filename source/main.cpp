@@ -8,6 +8,8 @@
 #include <string>
 #include <algorithm> 
 #include <cmath>
+#include <map>
+#include <sys/stat.h> 
 
 enum AppState { STATE_LIBRARY, STATE_READING };
 
@@ -24,31 +26,44 @@ bool is_supported_file(const std::string& fname) {
     if (pos == std::string::npos) return false;
     std::string ext = fname.substr(pos);
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    return ext == ".epub" || ext == ".pdf" || ext == ".cbr" || ext == ".cbz";
+    return ext == ".epub" || ext == ".pdf" || ext == ".cbz";
 }
 
-// --- HÀM LƯU/ĐỌC TIẾN ĐỘ TỪNG SÁCH ---
+bool is_fixed_layout(const std::string& fname) {
+    size_t pos = fname.find_last_of('.');
+    if (pos == std::string::npos) return false;
+    std::string ext = fname.substr(pos);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext == ".pdf" || ext == ".cbz";
+}
+
+// --- HÀM LƯU/ĐỌC TIẾN ĐỘ ---
 int load_progress(const std::string& filepath) {
+    size_t pos = filepath.find_last_of('/');
+    std::string filename = (pos == std::string::npos) ? filepath : filepath.substr(pos + 1);
+    std::string save_path = "sdmc:/lib/save/" + filename + ".save";
+    
     int page = 0; float dummy; 
-    std::string save_path = filepath + ".save";
     FILE* f = fopen(save_path.c_str(), "r");
     if (f) { if (fscanf(f, "%d %f", &page, &dummy) < 1) page = 0; fclose(f); }
     return page;
 }
 
 void save_progress(const std::string& filepath, int page) {
-    std::string save_path = filepath + ".save";
+    size_t pos = filepath.find_last_of('/');
+    std::string filename = (pos == std::string::npos) ? filepath : filepath.substr(pos + 1);
+    std::string save_path = "sdmc:/lib/save/" + filename + ".save";
+    
     FILE* f = fopen(save_path.c_str(), "w");
     if (f) { fprintf(f, "%d", page); fclose(f); }
 }
 
-// --- HÀM LƯU/ĐỌC CÀI ĐẶT GLOBAL ---
-void load_global_settings(float& size, int& is_portrait, int& is_dark_mode, int& bg_index, std::string& last_read) {
-    size = 18.0f; is_portrait = 0; is_dark_mode = 0; bg_index = 0; last_read = "";
+void load_global_settings(float& size, int& is_portrait, int& is_dark_mode, int& bg_index, int& sort_asc, std::string& last_read) {
+    size = 18.0f; is_portrait = 0; is_dark_mode = 0; bg_index = 0; sort_asc = 1; last_read = "";
     FILE* f = fopen("sdmc:/lib/global_setting.dat", "r");
     if (f) {
         char path_buf[512] = {0};
-        if (fscanf(f, "%f %d %d %d\n", &size, &is_portrait, &is_dark_mode, &bg_index) >= 1) {
+        if (fscanf(f, "%f %d %d %d %d\n", &size, &is_portrait, &is_dark_mode, &bg_index, &sort_asc) >= 1) {
             if (fgets(path_buf, sizeof(path_buf), f)) {
                 last_read = path_buf;
                 while (!last_read.empty() && (last_read.back() == '\n' || last_read.back() == '\r')) {
@@ -62,56 +77,76 @@ void load_global_settings(float& size, int& is_portrait, int& is_dark_mode, int&
     if (bg_index < 0 || bg_index > 2) bg_index = 0; 
 }
 
-void save_global_settings(float size, int is_portrait, int is_dark_mode, int bg_index, const std::string& last_read) {
+void save_global_settings(float size, int is_portrait, int is_dark_mode, int bg_index, int sort_asc, const std::string& last_read) {
     FILE* f = fopen("sdmc:/lib/global_setting.dat", "w");
     if (f) {
-        fprintf(f, "%f %d %d %d\n%s", size, is_portrait, is_dark_mode, bg_index, last_read.c_str());
+        fprintf(f, "%f %d %d %d %d\n%s", size, is_portrait, is_dark_mode, bg_index, sort_asc, last_read.c_str());
         fclose(f);
     }
 }
 
-// --- HÀM RENDER TRANG SÁCH & DARK MODE ---
-void load_page(fz_context *ctx, fz_document *doc, int page_num, SDL_Renderer *renderer, SDL_Texture **page_texture, bool dark_mode, float target_w, float target_h) {
+// --- THUẬT TOÁN RENDER & FALLBACK CHỐNG ĐEN MÀN HÌNH ---
+void load_page(fz_context *ctx, fz_document *doc, int page_num, SDL_Renderer *renderer, SDL_Texture **page_texture, bool dark_mode, float target_w, float target_h, float requested_multiplier, float& out_actual_scale) {
     if (*page_texture) { SDL_DestroyTexture(*page_texture); *page_texture = NULL; }
-    fz_try(ctx) {
-        fz_page *page = fz_load_page(ctx, doc, page_num);
-        fz_rect bounds = fz_bound_page(ctx, page);
-        fz_drop_page(ctx, page);
-
-        float bw = bounds.x1 - bounds.x0;
-        float bh = bounds.y1 - bounds.y0;
-        if (bw <= 0) bw = 100.0f; 
-        if (bh <= 0) bh = 100.0f;
-
-        float scale_x = target_w / bw;
-        float scale_y = target_h / bh;
-        float scale = std::min(scale_x, scale_y);
-
-        fz_matrix transform = fz_scale(scale, scale);
-        fz_pixmap *pix = fz_new_pixmap_from_page_number(ctx, doc, page_num, transform, fz_device_rgb(ctx), 0);
-        
-        int w = fz_pixmap_width(ctx, pix);
-        int h = fz_pixmap_height(ctx, pix);
-        unsigned char* samples = fz_pixmap_samples(ctx, pix);
-        
-        SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(samples, w, h, 24, w * 3, 0x0000FF, 0x00FF00, 0xFF0000, 0);
-        if (surface) {
-            if (dark_mode) {
-                Uint8* p = (Uint8*)surface->pixels;
-                int total_bytes = w * h * 3;
-                for (int i = 0; i < total_bytes; i++) p[i] = 255 - p[i];
-            }
-            SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
-            *page_texture = SDL_CreateTextureFromSurface(renderer, surface);
-            SDL_FreeSurface(surface);
-        }
-        fz_drop_pixmap(ctx, pix);
-    } fz_catch(ctx) {}
     
-    fz_empty_store(ctx); 
+    std::vector<float> multipliers;
+    if (requested_multiplier > 1.0f) multipliers.push_back(requested_multiplier);
+    multipliers.push_back(1.0f);
+    multipliers.push_back(0.5f);
+    
+    for (float current_mult : multipliers) {
+        bool success = false;
+        fz_try(ctx) {
+            fz_page *page = fz_load_page(ctx, doc, page_num);
+            fz_rect bounds = fz_bound_page(ctx, page);
+            fz_drop_page(ctx, page);
+
+            float bw = std::max(bounds.x1 - bounds.x0, 100.0f);
+            float bh = std::max(bounds.y1 - bounds.y0, 100.0f);
+
+            float scale_x = (target_w * current_mult) / bw;
+            float scale_y = (target_h * current_mult) / bh;
+            float scale = std::min(scale_x, scale_y);
+            
+            // Giới hạn an toàn tuyệt đối cho VRAM Switch (4096px)
+            float max_safe_scale_w = 4096.0f / bw;
+            float max_safe_scale_h = 4096.0f / bh;
+            scale = std::min({scale, max_safe_scale_w, max_safe_scale_h});
+
+            fz_matrix transform = fz_scale(scale, scale);
+            fz_pixmap *pix = fz_new_pixmap_from_page_number(ctx, doc, page_num, transform, fz_device_rgb(ctx), 0);
+            
+            int w = fz_pixmap_width(ctx, pix);
+            int h = fz_pixmap_height(ctx, pix);
+            
+            if (w > 0 && h > 0) {
+                unsigned char* samples = fz_pixmap_samples(ctx, pix);
+                SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(samples, w, h, 24, w * 3, 0x0000FF, 0x00FF00, 0xFF0000, 0);
+                if (surface) {
+                    if (dark_mode) {
+                        Uint8* p = (Uint8*)surface->pixels;
+                        int total_bytes = w * h * 3;
+                        for (int i = 0; i < total_bytes; i++) p[i] = 255 - p[i];
+                    }
+                    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1"); 
+                    *page_texture = SDL_CreateTextureFromSurface(renderer, surface);
+                    SDL_FreeSurface(surface);
+                }
+            }
+            fz_drop_pixmap(ctx, pix);
+            
+            if (*page_texture != NULL) {
+                success = true;
+                out_actual_scale = scale; // Truyền chính xác tỷ lệ đã sử dụng ra ngoài
+            }
+        } fz_catch(ctx) { success = false; }
+        
+        if (success) break;
+        else fz_empty_store(ctx); // Xả sạch rác RAM để thử độ nét thấp hơn
+    }
 }
 
-void update_layout(fz_context* ctx, fz_document* doc, bool is_portrait, float font_size, int& current_page, int& total_pages, float exact_progress, SDL_Renderer* renderer, SDL_Texture** page_texture, bool dark_mode) {
+void update_layout(fz_context* ctx, fz_document* doc, bool is_portrait, float font_size, int& current_page, int& total_pages, float exact_progress, SDL_Renderer* renderer, SDL_Texture** page_texture, bool dark_mode, float requested_multiplier, float& active_scale) {
     float layout_w = is_portrait ? 720.0f : 800.0f;
     float layout_h = is_portrait ? 1270.0f : 670.0f; 
     
@@ -122,11 +157,12 @@ void update_layout(fz_context* ctx, fz_document* doc, bool is_portrait, float fo
     if (current_page >= total_pages) current_page = total_pages - 1;
     if (current_page < 0) current_page = 0;
     
-    load_page(ctx, doc, current_page, renderer, page_texture, dark_mode, layout_w, layout_h);
+    load_page(ctx, doc, current_page, renderer, page_texture, dark_mode, layout_w, layout_h, requested_multiplier, active_scale);
 }
 
 int main(int argc, char* argv[]) {
     romfsInit();
+    mkdir("sdmc:/lib/save", 0777);
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
@@ -145,16 +181,17 @@ int main(int argc, char* argv[]) {
     bg_textures[2] = IMG_LoadTexture(renderer, "romfs:/bg3.jpg");
     if (!bg_textures[0]) bg_textures[0] = IMG_LoadTexture(renderer, "romfs:/bg.jpg");
 
-    // NẠP ICON TỪ ROMFS ĐỂ DÙNG Ở MÀN HÌNH LOADING
     SDL_Texture* app_icon_tex = IMG_LoadTexture(renderer, "romfs:/icon.png");
     if (!app_icon_tex) app_icon_tex = IMG_LoadTexture(renderer, "romfs:/icon.jpg");
 
     float global_font_size;
-    int is_port_int, is_dark_int, current_bg_index;
+    int is_port_int, is_dark_int, current_bg_index, sort_asc_int;
     std::string last_read_filepath;
-    load_global_settings(global_font_size, is_port_int, is_dark_int, current_bg_index, last_read_filepath);
+    
+    load_global_settings(global_font_size, is_port_int, is_dark_int, current_bg_index, sort_asc_int, last_read_filepath);
     bool is_portrait = (is_port_int != 0);
     bool is_dark_mode = (is_dark_int != 0);
+    bool sort_asc = (sort_asc_int != 0);
 
     fz_context *ctx = fz_new_context(NULL, NULL, 16 * 1024 * 1024);
     fz_register_document_handlers(ctx);
@@ -162,7 +199,6 @@ int main(int argc, char* argv[]) {
 
     std::vector<Book> library;
 
-    // QUÉT LẦN 1: ĐẾM TỔNG SỐ FILE 
     int total_files = 0;
     DIR *dir = opendir("sdmc:/lib");
     if (dir) {
@@ -173,7 +209,6 @@ int main(int argc, char* argv[]) {
         closedir(dir);
     }
 
-    // QUÉT LẦN 2: NẠP SÁCH & RENDER LOADING SCREEN MƯỢT MÀ
     if (total_files > 0 && (dir = opendir("sdmc:/lib")) != NULL) {
         int index = 0;
         struct dirent *ent;
@@ -181,7 +216,6 @@ int main(int argc, char* argv[]) {
             std::string fname = ent->d_name;
             if (is_supported_file(fname)) {
                 
-                // === VẼ MÀN HÌNH LOADING *TRƯỚC* KHI NẠP SÁCH ===
                 SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
                 SDL_RenderClear(renderer);
                 if (bg_textures[current_bg_index]) {
@@ -189,31 +223,26 @@ int main(int argc, char* argv[]) {
                     SDL_RenderCopy(renderer, bg_textures[current_bg_index], NULL, &bg_rect);
                 }
                 SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200); // Lớp mờ đen
+                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200);
                 SDL_Rect overlay = {0, 0, 1280, 720};
                 SDL_RenderFillRect(renderer, &overlay);
                 SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
 
-                // Hiển thị Icon App
                 if (app_icon_tex) {
-                    SDL_Rect icon_dest = { 1280/2 - 60, 720/2 - 100, 150, 150 };
+                    SDL_Rect icon_dest = { 1280/2 - 100, 720/2 - 140, 200, 200 };
                     SDL_RenderCopy(renderer, app_icon_tex, NULL, &icon_dest);
                 }
 
-                // Vẽ thanh Progress (Tính phần trăm chính xác)
                 float progress = (float)index / total_files;
-                SDL_Rect bg_bar = { 1280/2 - 200, 720/2 + 60, 400, 8 };
+                SDL_Rect bg_bar = { 1280/2 - 200, 720/2 + 100, 400, 8 };
                 SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
                 SDL_RenderFillRect(renderer, &bg_bar);
                 
-                SDL_Rect fg_bar = { 1280/2 - 200, 720/2 + 60, (int)(400 * progress), 8 };
+                SDL_Rect fg_bar = { 1280/2 - 200, 720/2 + 100, (int)(400 * progress), 8 };
                 SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
                 SDL_RenderFillRect(renderer, &fg_bar);
-                
-                SDL_RenderPresent(renderer); // XUẤT HÌNH NGAY LẬP TỨC
-                // =================================================
+                SDL_RenderPresent(renderer); 
 
-                // === BẮT ĐẦU XỬ LÝ NẶNG BÊN DƯỚI NỀN ===
                 Book b; 
                 b.filepath = "sdmc:/lib/" + fname;
                 b.cover_tex = NULL;
@@ -233,8 +262,9 @@ int main(int argc, char* argv[]) {
                     float bh = bounds.y1 - bounds.y0;
                     if (bw <= 0) bw = 100.0f;
                     if (bh <= 0) bh = 100.0f;
-                    float scale_x = 180.0f / bw;
-                    float scale_y = 260.0f / bh;
+                    
+                    float scale_x = 360.0f / bw;
+                    float scale_y = 520.0f / bh;
                     float scale = std::min(scale_x, scale_y);
 
                     fz_pixmap *pix = fz_new_pixmap_from_page_number(ctx, temp_doc, 0, fz_scale(scale, scale), fz_device_rgb(ctx), 0);
@@ -258,6 +288,7 @@ int main(int argc, char* argv[]) {
                     b.src_rect = (min_x <= max_x && min_y <= max_y) ? SDL_Rect{min_x, min_y, max_x - min_x + 1, max_y - min_y + 1} : SDL_Rect{0, 0, w, h};
 
                     SDL_Surface* surf = SDL_CreateRGBSurfaceFrom(samples, w, h, 24, w * 3, 0x0000FF, 0x00FF00, 0xFF0000, 0);
+                    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1"); 
                     b.cover_tex = SDL_CreateTextureFromSurface(renderer, surf);
                     SDL_FreeSurface(surf);
                     fz_drop_pixmap(ctx, pix);
@@ -266,17 +297,26 @@ int main(int argc, char* argv[]) {
                 if (temp_doc) fz_drop_document(ctx, temp_doc);
                 fz_empty_store(ctx); 
                 
-                int col = index % 5;
-                int row = index / 5;
-                b.rect = { 60 + col * 235, 60 + row * 310, 180, 260 }; 
                 library.push_back(b);
-                
-                index++; // Tăng biến index sau khi xử lý xong 1 sách
+                index++; 
             }
         }
         closedir(dir);
 
-        // VẼ MÀN HÌNH 100% TRƯỚC KHI VÀO GIAO DIỆN CHÍNH
+        std::sort(library.begin(), library.end(), [sort_asc](const Book& a, const Book& b) {
+            std::string nameA = a.filepath.substr(10); 
+            std::string nameB = b.filepath.substr(10);
+            if (sort_asc) return nameA < nameB;
+            return nameA > nameB;
+        });
+
+        // Tái tạo lưới thư viện 5 Cột tràn viền
+        for (size_t i = 0; i < library.size(); i++) {
+            int col = i % 5;
+            int row = i / 5;
+            library[i].rect = { 60 + col * 235, 60 + row * 310, 180, 260 };
+        }
+
         SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
         SDL_RenderClear(renderer);
         if (bg_textures[current_bg_index]) {
@@ -290,13 +330,13 @@ int main(int argc, char* argv[]) {
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
 
         if (app_icon_tex) {
-            SDL_Rect icon_dest = { 1280/2 - 60, 720/2 - 100, 120, 120 };
+            SDL_Rect icon_dest = { 1280/2 - 100, 720/2 - 140, 200, 200 };
             SDL_RenderCopy(renderer, app_icon_tex, NULL, &icon_dest);
         }
-        SDL_Rect bg_bar = { 1280/2 - 200, 720/2 + 60, 400, 8 };
+        SDL_Rect bg_bar = { 1280/2 - 200, 720/2 + 100, 400, 8 };
         SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
         SDL_RenderFillRect(renderer, &bg_bar);
-        SDL_Rect fg_bar = { 1280/2 - 200, 720/2 + 60, 400, 8 }; // Full 100%
+        SDL_Rect fg_bar = { 1280/2 - 200, 720/2 + 100, 400, 8 }; 
         SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
         SDL_RenderFillRect(renderer, &fg_bar);
         SDL_RenderPresent(renderer);
@@ -308,9 +348,19 @@ int main(int argc, char* argv[]) {
     std::string active_filepath = "";
     int total_pages = 0, current_page = 0;
     float exact_progress = 0.0f;
+    float active_scale = 1.0f; // Thêm biến toàn cục để theo dõi Tỷ lệ nét đang thực sự dùng
 
     float scroll_y = 0.0f;
     float target_scroll_y = 0.0f;
+
+    std::map<SDL_FingerID, SDL_FPoint> fingers;
+    float zoom_level = 1.0f;
+    float base_zoom = 1.0f;
+    float pan_x = 0.0f, pan_y = 0.0f;
+    float pan_start_x = 0.0f, pan_start_y = 0.0f;
+    float pan_base_x = 0.0f, pan_base_y = 0.0f;
+    float initial_pinch_dist = 0.0f;
+    Uint32 last_tap_time = 0;
 
     int selected_book_index = 0; 
     bool running = true, is_touching = false;
@@ -319,7 +369,6 @@ int main(int argc, char* argv[]) {
     bool has_swiped = false;
 
     auto open_book = [&](const Book& b) {
-        // HIỂN THỊ MÀN HÌNH LOADING KHI MỞ TỪNG QUYỂN SÁCH
         SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
         SDL_RenderClear(renderer);
         if (bg_textures[current_bg_index]) {
@@ -348,25 +397,29 @@ int main(int argc, char* argv[]) {
         SDL_RenderFillRect(renderer, &load_line);
         SDL_RenderPresent(renderer);
 
-        // XỬ LÝ SÁCH SAU KHI ĐÃ HIỂN THỊ UI
         if (active_doc) fz_drop_document(ctx, active_doc);
         active_filepath = b.filepath;
         last_read_filepath = b.filepath; 
+        
+        zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f;
+        fingers.clear();
+        
         fz_try(ctx) {
             active_doc = fz_open_document(ctx, b.filepath.c_str());
             current_page = load_progress(active_filepath);
             
             float target_w = is_portrait ? 720.0f : 800.0f;
             float target_h = is_portrait ? 1270.0f : 670.0f; 
+            float requested_multiplier = is_fixed_layout(active_filepath) ? 2.0f : 1.0f;
+
             fz_layout_document(ctx, active_doc, target_w, target_h, global_font_size);
             total_pages = fz_count_pages(ctx, active_doc);
             
             if (current_page >= total_pages) current_page = total_pages - 1;
             if (current_page < 0) current_page = 0;
-            
             exact_progress = total_pages > 1 ? (float)current_page / (total_pages - 1) : 0.0f;
             
-            load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
+            load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h, requested_multiplier, active_scale);
             state = STATE_READING;
         } fz_catch(ctx) {}
     };
@@ -383,34 +436,36 @@ int main(int argc, char* argv[]) {
                 if (current_bg_index > 2) current_bg_index = 0; 
             }
 
+            if (kDown & HidNpadButton_Y) {
+                sort_asc = !sort_asc; 
+                std::sort(library.begin(), library.end(), [sort_asc](const Book& a, const Book& b) {
+                    std::string nameA = a.filepath.substr(10); 
+                    std::string nameB = b.filepath.substr(10);
+                    if (sort_asc) return nameA < nameB;
+                    return nameA > nameB;
+                });
+                for (size_t i = 0; i < library.size(); i++) {
+                    int col = i % 5; int row = i / 5;
+                    library[i].rect.x = 60 + col * 235; library[i].rect.y = 60 + row * 310;
+                }
+                selected_book_index = 0; target_scroll_y = 0.0f; scroll_y = 0.0f;
+                save_global_settings(global_font_size, is_portrait ? 1 : 0, is_dark_mode ? 1 : 0, current_bg_index, sort_asc ? 1 : 0, last_read_filepath);
+            }
+
             if (!library.empty()) {
-                if (kDown & (HidNpadButton_Left | HidNpadButton_StickLLeft)) {
-                    if (selected_book_index > 0) selected_book_index--;
-                }
-                if (kDown & (HidNpadButton_Right | HidNpadButton_StickLRight)) {
-                    if (selected_book_index < (int)library.size() - 1) selected_book_index++;
-                }
-                if (kDown & (HidNpadButton_Up | HidNpadButton_StickLUp)) {
-                    if (selected_book_index >= 5) selected_book_index -= 5;
-                    else selected_book_index = 0; 
-                }
-                if (kDown & (HidNpadButton_Down | HidNpadButton_StickLDown)) {
-                    if (selected_book_index + 5 < (int)library.size()) selected_book_index += 5;
-                    else selected_book_index = (int)library.size() - 1; 
-                }
+                if (kDown & (HidNpadButton_Left | HidNpadButton_StickLLeft)) if (selected_book_index > 0) selected_book_index--;
+                if (kDown & (HidNpadButton_Right | HidNpadButton_StickLRight)) if (selected_book_index < (int)library.size() - 1) selected_book_index++;
+                if (kDown & (HidNpadButton_Up | HidNpadButton_StickLUp)) selected_book_index = std::max(0, selected_book_index - 5);
+                if (kDown & (HidNpadButton_Down | HidNpadButton_StickLDown)) selected_book_index = std::min((int)library.size() - 1, selected_book_index + 5);
 
                 int selected_row = selected_book_index / 5;
                 int book_top = 60 + selected_row * 310;
                 int book_bottom = book_top + 260;
 
-                if (book_bottom > target_scroll_y + 720 - 60) {
-                    target_scroll_y = book_bottom - 720 + 60;
-                } 
-                else if (book_top < target_scroll_y + 60) {
-                    target_scroll_y = book_top - 60;
-                }
+                if (book_bottom > target_scroll_y + 720 - 60) target_scroll_y = book_bottom - 720 + 60;
+                else if (book_top < target_scroll_y + 60) target_scroll_y = book_top - 60;
 
-                int max_row = (library.size() - 1) / 5;
+                int max_row = library.empty() ? 0 : (library.size() - 1) / 5;
                 int max_scroll = (60 + max_row * 310 + 260 + 60) - 720;
                 if (max_scroll < 0) max_scroll = 0;
                 if (target_scroll_y < 0) target_scroll_y = 0;
@@ -419,12 +474,7 @@ int main(int argc, char* argv[]) {
                 if (kDown & HidNpadButton_A) open_book(library[selected_book_index]);
                 if (kDown & HidNpadButton_X) {
                     if (!last_read_filepath.empty()) {
-                        for (const auto& book : library) {
-                            if (book.filepath == last_read_filepath) {
-                                open_book(book);
-                                break;
-                            }
-                        }
+                        for (const auto& book : library) if (book.filepath == last_read_filepath) { open_book(book); break; }
                     }
                 }
             }
@@ -432,11 +482,11 @@ int main(int argc, char* argv[]) {
         else if (state == STATE_READING) {
             float target_w = is_portrait ? 720.0f : 800.0f;
             float target_h = is_portrait ? 1270.0f : 670.0f;
+            float requested_multiplier = is_fixed_layout(active_filepath) ? 2.0f : 1.0f;
 
             if (kDown & HidNpadButton_B) {
                 save_progress(active_filepath, current_page);
-                save_global_settings(global_font_size, is_portrait ? 1 : 0, is_dark_mode ? 1 : 0, current_bg_index, last_read_filepath);
-                
+                save_global_settings(global_font_size, is_portrait ? 1 : 0, is_dark_mode ? 1 : 0, current_bg_index, sort_asc ? 1 : 0, last_read_filepath);
                 if (page_texture) { SDL_DestroyTexture(page_texture); page_texture = NULL; }
                 if (active_doc) { fz_drop_document(ctx, active_doc); active_doc = NULL; }
                 fz_empty_store(ctx); 
@@ -445,26 +495,38 @@ int main(int argc, char* argv[]) {
 
             if (kDown & HidNpadButton_Minus) {
                 is_dark_mode = !is_dark_mode;
-                load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
+                load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h, requested_multiplier, active_scale);
             }
 
             if (kDown & HidNpadButton_R) {
                 is_portrait = !is_portrait;
-                update_layout(ctx, active_doc, is_portrait, global_font_size, current_page, total_pages, exact_progress, renderer, &page_texture, is_dark_mode);
+                zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f; 
+                update_layout(ctx, active_doc, is_portrait, global_font_size, current_page, total_pages, exact_progress, renderer, &page_texture, is_dark_mode, requested_multiplier, active_scale);
+            }
+
+            if (kDown & HidNpadButton_L) {
+                if (current_page > 0) {
+                    current_page = 0;
+                    zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f; 
+                    exact_progress = 0.0f; 
+                    load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h, requested_multiplier, active_scale);
+                }
             }
 
             if ((kDown & HidNpadButton_Right) || (kDown & HidNpadButton_A)) {
                 if (current_page < total_pages - 1) {
                     current_page++;
+                    zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f; 
                     exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
-                    load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
+                    load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h, requested_multiplier, active_scale);
                 }
             }
             if (kDown & HidNpadButton_Left) {
                 if (current_page > 0) {
                     current_page--;
+                    zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f; 
                     exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
-                    load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
+                    load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h, requested_multiplier, active_scale);
                 }
             }
 
@@ -473,7 +535,8 @@ int main(int argc, char* argv[]) {
                 if (kDown & HidNpadButton_Y) global_font_size -= 2.0f; 
                 if (global_font_size > 60.0f) global_font_size = 60.0f;
                 if (global_font_size < 10.0f) global_font_size = 10.0f;
-                update_layout(ctx, active_doc, is_portrait, global_font_size, current_page, total_pages, exact_progress, renderer, &page_texture, is_dark_mode);
+                zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f; 
+                update_layout(ctx, active_doc, is_portrait, global_font_size, current_page, total_pages, exact_progress, renderer, &page_texture, is_dark_mode, requested_multiplier, active_scale);
             }
         }
 
@@ -495,56 +558,121 @@ int main(int argc, char* argv[]) {
             }
 
             if (event.type == SDL_FINGERDOWN) {
-                is_touching = true;
-                start_touch_x = logical_x;
-                start_touch_y = logical_y;
-                start_scroll_y = target_scroll_y; 
-                has_swiped = false;
-            }
-            else if (event.type == SDL_FINGERMOTION && is_touching) {
-                float dx = logical_x - start_touch_x;
-                float dy = logical_y - start_touch_y;
-                if (std::abs(dx) > 15.0f || std::abs(dy) > 15.0f) has_swiped = true;
+                fingers[event.tfinger.fingerId] = {logical_x, logical_y};
 
-                if (state == STATE_LIBRARY && has_swiped) {
-                    target_scroll_y = start_scroll_y - dy;
-                    
-                    int max_row = library.empty() ? 0 : (library.size() - 1) / 5;
-                    int max_scroll = (60 + max_row * 310 + 260 + 60) - 720;
-                    if (max_scroll < 0) max_scroll = 0;
-                    if (target_scroll_y < 0) target_scroll_y = 0;
-                    if (target_scroll_y > max_scroll) target_scroll_y = max_scroll;
-                    
-                    scroll_y = target_scroll_y; 
+                bool can_zoom = is_fixed_layout(active_filepath);
+
+                if (state == STATE_READING) {
+                    if (fingers.size() == 1) {
+                        Uint32 current_time = SDL_GetTicks();
+                        if (current_time - last_tap_time < 300 && can_zoom) {
+                            zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f;
+                            last_tap_time = 0;
+                        } else {
+                            last_tap_time = current_time;
+                            start_touch_x = logical_x; start_touch_y = logical_y;
+                            pan_start_x = logical_x; pan_start_y = logical_y;
+                            pan_base_x = pan_x; pan_base_y = pan_y;
+                            has_swiped = false;
+                            is_touching = true;
+                        }
+                    } else if (fingers.size() == 2 && can_zoom) {
+                        auto it = fingers.begin();
+                        SDL_FPoint f1 = it->second; it++;
+                        SDL_FPoint f2 = it->second;
+                        initial_pinch_dist = std::sqrt(std::pow(f1.x - f2.x, 2) + std::pow(f1.y - f2.y, 2));
+                        base_zoom = zoom_level;
+                        is_touching = false; 
+                    }
+                } else if (state == STATE_LIBRARY) {
+                    if (fingers.size() == 1) {
+                        start_touch_x = logical_x; start_touch_y = logical_y;
+                        start_scroll_y = target_scroll_y; 
+                        has_swiped = false;
+                        is_touching = true;
+                    }
                 }
             }
-            else if (event.type == SDL_FINGERUP && is_touching) {
-                is_touching = false;
-                
-                if (!has_swiped && state == STATE_LIBRARY) {
-                    for (size_t i = 0; i < library.size(); i++) {
-                        auto& b = library[i];
-                        if (logical_x >= b.rect.x && logical_x <= b.rect.x + b.rect.w && 
-                            logical_y >= (b.rect.y - scroll_y) && logical_y <= (b.rect.y - scroll_y) + b.rect.h) {
-                            selected_book_index = i; 
-                            open_book(b);
-                            break;
+            else if (event.type == SDL_FINGERMOTION) {
+                if (fingers.find(event.tfinger.fingerId) != fingers.end()) {
+                    fingers[event.tfinger.fingerId] = {logical_x, logical_y};
+                }
+
+                bool can_zoom = is_fixed_layout(active_filepath);
+
+                if (state == STATE_READING) {
+                    if (fingers.size() == 2 && can_zoom) {
+                        auto it = fingers.begin();
+                        SDL_FPoint f1 = it->second; it++;
+                        SDL_FPoint f2 = it->second;
+                        float new_dist = std::sqrt(std::pow(f1.x - f2.x, 2) + std::pow(f1.y - f2.y, 2));
+                        if (initial_pinch_dist > 0) {
+                            zoom_level = base_zoom * (new_dist / initial_pinch_dist);
+                            if (zoom_level < 1.0f) { zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f; } 
+                            if (zoom_level > 5.0f) zoom_level = 5.0f; 
+                        }
+                    } else if (fingers.size() == 1 && is_touching) {
+                        float dx = logical_x - start_touch_x;
+                        float dy = logical_y - start_touch_y;
+                        if (std::abs(dx) > 15.0f || std::abs(dy) > 15.0f) has_swiped = true;
+                        
+                        if (zoom_level > 1.0f && can_zoom) {
+                            pan_x = pan_base_x + (logical_x - pan_start_x);
+                            pan_y = pan_base_y + (logical_y - pan_start_y);
+                        }
+                    }
+                } else if (state == STATE_LIBRARY && is_touching) {
+                    float dx = logical_x - start_touch_x;
+                    float dy = logical_y - start_touch_y;
+                    if (std::abs(dx) > 15.0f || std::abs(dy) > 15.0f) has_swiped = true;
+
+                    if (has_swiped) {
+                        target_scroll_y = start_scroll_y - dy;
+                        int max_row = library.empty() ? 0 : (library.size() - 1) / 5;
+                        int max_scroll = (60 + max_row * 310 + 260 + 60) - 720;
+                        if (max_scroll < 0) max_scroll = 0;
+                        if (target_scroll_y < 0) target_scroll_y = 0;
+                        if (target_scroll_y > max_scroll) target_scroll_y = max_scroll;
+                        scroll_y = target_scroll_y; 
+                    }
+                }
+            }
+            else if (event.type == SDL_FINGERUP) {
+                fingers.erase(event.tfinger.fingerId);
+
+                if (state == STATE_LIBRARY && is_touching && fingers.size() == 0) {
+                    is_touching = false;
+                    if (!has_swiped) {
+                        for (size_t i = 0; i < library.size(); i++) {
+                            auto& b = library[i];
+                            if (logical_x >= b.rect.x && logical_x <= b.rect.x + b.rect.w && 
+                                logical_y >= (b.rect.y - scroll_y) && logical_y <= (b.rect.y - scroll_y) + b.rect.h) {
+                                selected_book_index = i; 
+                                open_book(b);
+                                break;
+                            }
                         }
                     }
                 } 
-                else if (state == STATE_READING && has_swiped) {
-                    float dx = logical_x - start_touch_x;
-                    float target_w = is_portrait ? 720.0f : 800.0f;
-                    float target_h = is_portrait ? 1270.0f : 670.0f;
+                else if (state == STATE_READING && is_touching && fingers.size() == 0) {
+                    is_touching = false;
+                    if (has_swiped && zoom_level <= 1.0f) {
+                        float target_w = is_portrait ? 720.0f : 800.0f;
+                        float target_h = is_portrait ? 1270.0f : 670.0f;
+                        float requested_multiplier = is_fixed_layout(active_filepath) ? 2.0f : 1.0f;
 
-                    if (dx < -100.0f && current_page < total_pages - 1) { 
-                        current_page++;
-                        exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
-                        load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
-                    } else if (dx > 100.0f && current_page > 0) { 
-                        current_page--;
-                        exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
-                        load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h);
+                        float dx = logical_x - start_touch_x;
+                        if (dx < -100.0f && current_page < total_pages - 1) { 
+                            current_page++;
+                            zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f;
+                            exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
+                            load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h, requested_multiplier, active_scale);
+                        } else if (dx > 100.0f && current_page > 0) { 
+                            current_page--;
+                            zoom_level = 1.0f; pan_x = 0.0f; pan_y = 0.0f;
+                            exact_progress = (float)current_page / (total_pages > 1 ? total_pages - 1 : 1);
+                            load_page(ctx, active_doc, current_page, renderer, &page_texture, is_dark_mode, target_w, target_h, requested_multiplier, active_scale);
+                        }
                     }
                 }
             }
@@ -568,6 +696,7 @@ int main(int argc, char* argv[]) {
 
                 SDL_Rect draw_rect = { b.rect.x, b.rect.y - (int)scroll_y, b.rect.w, b.rect.h };
 
+                // KHÔI PHỤC MÀU VIỀN VÀNG TRUYỀN THỐNG
                 if ((int)i == selected_book_index) {
                     SDL_SetRenderDrawColor(renderer, 255, 235, 50, 255); 
                 } 
@@ -591,23 +720,40 @@ int main(int argc, char* argv[]) {
                 SDL_QueryTexture(page_texture, NULL, NULL, &tex_w, &tex_h);
             }
 
+            // TÍNH TOÁN LẠI TỌA ĐỘ SCREEN DỰA VÀO ĐỘ NÉT THỰC TẾ
+            if (active_scale <= 0.0001f) active_scale = 1.0f; // Chống lỗi chia cho 0
+
             if (is_portrait) {
                 SDL_SetRenderTarget(renderer, render_target_vert);
                 SDL_SetRenderDrawColor(renderer, is_dark_mode ? 20 : 255, is_dark_mode ? 20 : 255, is_dark_mode ? 20 : 255, 255);
                 SDL_RenderClear(renderer);
                 
                 if (page_texture) {
-                    SDL_Rect dest = { (720 - tex_w) / 2, (1270 - tex_h) / 2, tex_w, tex_h };
+                    // Cắt nghĩa: Kích thước thật của trang PDF = Cỡ ảnh VRAM / Tỷ lệ nhân đã dùng
+                    float bw = tex_w / active_scale;
+                    float bh = tex_h / active_scale;
+                    
+                    // Tính xem cần thu phóng bao nhiêu để vừa khít cái viền đọc sách
+                    float fit_scale = std::min(720.0f / bw, 1270.0f / bh);
+                    int base_w = (int)(bw * fit_scale);
+                    int base_h = (int)(bh * fit_scale);
+                    
+                    int scaled_w = (int)(base_w * zoom_level);
+                    int scaled_h = (int)(base_h * zoom_level);
+                    
+                    SDL_Rect dest = { (720 - scaled_w) / 2 + (int)pan_x, (1270 - scaled_h) / 2 + (int)pan_y, scaled_w, scaled_h };
                     SDL_RenderCopy(renderer, page_texture, NULL, &dest);
                 }
 
-                SDL_Rect bar_bg = {0, 1276, 720, 4}; 
-                SDL_SetRenderDrawColor(renderer, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, 255);
-                SDL_RenderFillRect(renderer, &bar_bg);
-                
-                SDL_Rect bar_fg = {0, 1276, (int)(720 * exact_progress), 4}; 
-                SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
-                SDL_RenderFillRect(renderer, &bar_fg);
+                if (zoom_level <= 1.0f) {
+                    SDL_Rect bar_bg = {0, 1276, 720, 4}; 
+                    SDL_SetRenderDrawColor(renderer, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, 255);
+                    SDL_RenderFillRect(renderer, &bar_bg);
+                    
+                    SDL_Rect bar_fg = {0, 1276, (int)(720 * exact_progress), 4}; 
+                    SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
+                    SDL_RenderFillRect(renderer, &bar_fg);
+                }
 
                 SDL_SetRenderTarget(renderer, NULL);
                 SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -620,17 +766,29 @@ int main(int argc, char* argv[]) {
                 SDL_RenderClear(renderer);
                 
                 if (page_texture) {
-                    SDL_Rect dest = { 240 + (800 - tex_w) / 2, 20 + (670 - tex_h) / 2, tex_w, tex_h };
+                    float bw = tex_w / active_scale;
+                    float bh = tex_h / active_scale;
+                    
+                    float fit_scale = std::min(800.0f / bw, 670.0f / bh);
+                    int base_w = (int)(bw * fit_scale);
+                    int base_h = (int)(bh * fit_scale);
+                    
+                    int scaled_w = (int)(base_w * zoom_level);
+                    int scaled_h = (int)(base_h * zoom_level);
+                    
+                    SDL_Rect dest = { 240 + (800 - scaled_w) / 2 + (int)pan_x, 20 + (670 - scaled_h) / 2 + (int)pan_y, scaled_w, scaled_h };
                     SDL_RenderCopy(renderer, page_texture, NULL, &dest);
                 }
 
-                SDL_Rect bar_bg = {240, 712, 800, 4}; 
-                SDL_SetRenderDrawColor(renderer, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, 255);
-                SDL_RenderFillRect(renderer, &bar_bg);
-                
-                SDL_Rect bar_fg = {240, 712, (int)(800 * exact_progress), 4}; 
-                SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
-                SDL_RenderFillRect(renderer, &bar_fg);
+                if (zoom_level <= 1.0f) {
+                    SDL_Rect bar_bg = {240, 712, 800, 4}; 
+                    SDL_SetRenderDrawColor(renderer, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, is_dark_mode ? 60 : 200, 255);
+                    SDL_RenderFillRect(renderer, &bar_bg);
+                    
+                    SDL_Rect bar_fg = {240, 712, (int)(800 * exact_progress), 4}; 
+                    SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255); 
+                    SDL_RenderFillRect(renderer, &bar_fg);
+                }
             }
         }
 
@@ -638,7 +796,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (state == STATE_READING) save_progress(active_filepath, current_page);
-    save_global_settings(global_font_size, is_portrait ? 1 : 0, is_dark_mode ? 1 : 0, current_bg_index, last_read_filepath);
+    save_global_settings(global_font_size, is_portrait ? 1 : 0, is_dark_mode ? 1 : 0, current_bg_index, sort_asc ? 1 : 0, last_read_filepath);
 
     for (auto& b : library) if (b.cover_tex) SDL_DestroyTexture(b.cover_tex);
     if (page_texture) SDL_DestroyTexture(page_texture);
